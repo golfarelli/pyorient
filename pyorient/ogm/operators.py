@@ -94,7 +94,7 @@ class Operand(RelativeOperand):
         return LogicalConnective(Operator.Is, (self, value))
 
     def is_not(self, value):
-        """ Test if a property is not nll
+        """ Test if a property is not null
 
         :param value: May (presently?) only be None
         """
@@ -129,6 +129,8 @@ class ArithmeticMixin(object):
         return ArithmeticOperation(Operator.Div, (self, other))
     def __rdiv__(self, left):
         return ArithmeticOperation(Operator.Div, (left, self))
+    def __truediv__(self, other): # Python 3.x
+        return ArithmeticOperation(Operator.Div, (self, other))
 
     def __mod__(self, other):
         return ArithmeticOperation(Operator.Mod, (self, other))

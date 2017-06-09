@@ -1,11 +1,12 @@
-from .operators import Operand, ArithmeticMixin
+from .operators import ArithmeticMixin
 from .what import (
     What, FunctionWhat
     , StringMethodMixin
     , CollectionMethodMixin
     , MapMethodMixin
-    , PropertyWhat
+    , PropertyWhat, AnyPropertyWhat
 )
+from .element import GraphElement
 
 import json
 import datetime
@@ -13,9 +14,10 @@ import decimal
 import string
 import sys
 
+from copy import deepcopy
 
 class Property(PropertyWhat):
-    num_instances = 0 # Basis for ordering property instances
+    _num_instances = 0 # Basis for ordering property instances
 
     def __init__(self, name=None, nullable=True
                  , default=None, indexed=False, unique=False
@@ -37,25 +39,25 @@ class Property(PropertyWhat):
         """
         super(Property, self).__init__([], [])
 
-        self.name = name
+        self._name = name
 
         if nullable:
-            self.nullable = True
-            self.mandatory = mandatory
+            self._nullable = True
+            self._mandatory = mandatory
         else:
-            self.nullable = False
-            self.mandatory = True
+            self._nullable = False
+            self._mandatory = True
 
-        self.default = default
-        self.indexed = indexed or unique
-        self.unique = unique
-        self.readonly = readonly
+        self._default = default
+        self._indexed = indexed or unique
+        self._unique = unique
+        self._readonly = readonly
 
         self._context = None
 
         # Class creation shouldn't straddle multiple threads...
-        self.instance_idx = Property.num_instances
-        Property.num_instances += 1
+        self._instance_idx = Property._num_instances
+        Property._num_instances += 1
 
     @property
     def context(self):
@@ -69,10 +71,13 @@ class Property(PropertyWhat):
         A property should not be shared between multiple contexts."""
         self._context = context
 
+        if not self.props:
+            self.props.append(self.context_name())
+
     def context_name(self):
-        if self.name:
-            return self.name
-        for prop_name, prop_value in self.context.__dict__.items():
+        if self._name:
+            return self._name
+        for prop_name, prop_value in self._context.__dict__.items():
             if self is prop_value:
                 return prop_name
         else:
@@ -80,6 +85,10 @@ class Property(PropertyWhat):
 
     def __format__(self, format_spec):
         return repr(self.context_name())
+
+    def __getattr__(self, attr):
+        self = AnyPropertyWhat(self.chain, deepcopy(self.props))
+        return self.__getattr__(attr)
 
 class UUID:
     def __str__(self):
@@ -96,9 +105,15 @@ class PropertyEncoder:
         return name
 
     @staticmethod
-    def encode_value(value):
+    def encode_value(value, expressions):
+        from pyorient.ogm.what import What
+
         if isinstance(value, decimal.Decimal):
-            return repr(str(value))
+            return u'"{:f}"'.format(value)
+        elif isinstance(value, float):
+            with decimal.localcontext() as ctx:
+                ctx.prec = 20  # floats are max 80-bits wide = 20 significant digits
+                return u'"{:f}"'.format(decimal.Decimal(value))
         elif isinstance(value, datetime.datetime) or isinstance(value, datetime.date):
             return u'"{}"'.format(value)
         elif isinstance(value, str):
@@ -113,15 +128,18 @@ class PropertyEncoder:
         elif isinstance(value, (int,float)) or (sys.version_info[0] < 3 and isinstance(value, long)):
             return str(value)
         elif isinstance(value, list) or isinstance(value, set):
-            return u'[{}]'.format(u','.join([PropertyEncoder.encode_value(v) for v in value]))
+            return u'[{}]'.format(u','.join([PropertyEncoder.encode_value(v, expressions) for v in value]))
         elif isinstance(value, dict):
             contents = u','.join([
-                '{}: {}'.format(PropertyEncoder.encode_value(k), PropertyEncoder.encode_value(v))
+                '{}: {}'.format(PropertyEncoder.encode_value(k, expressions),
+                                PropertyEncoder.encode_value(v, expressions))
                 for k, v in value.items()
             ])
             return u'{{ {} }}'.format(contents)
-        elif isinstance(value, FunctionWhat) and value.func == What.SysDate:
-            return 'sysdate({})'.format(','.join([PropertyEncoder.encode_value(v) for v in value.args if v is not None]))
+        elif isinstance(value, GraphElement):
+            return value._id
+        elif isinstance(value, What):
+            return expressions.build_what(value)
         else:
             # returning the same object will cause repr(value) to be used
             return value
@@ -175,7 +193,7 @@ class LinkedClassProperty(Property):
         """
         super(LinkedClassProperty, self).__init__(
             name, nullable, default, indexed, unique, mandatory, readonly)
-        self.linked_to = linked_to
+        self._linked_to = linked_to
 
 class Link(LinkedClassProperty):
     pass
@@ -202,3 +220,12 @@ class EmbeddedSet(LinkedProperty, CollectionMethodMixin):
 
 class EmbeddedMap(LinkedProperty, MapMethodMixin):
     pass
+
+class PreOp(object):
+    """Subclasses define operations to perform on graph before creating class properties."""
+    def __call__(self, graph, attr):
+        """Prepare the supplied graph.
+        :param attr: Name of attribute specifying PreOp
+        """
+        pass
+

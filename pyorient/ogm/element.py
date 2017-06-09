@@ -1,4 +1,4 @@
-from .property import Property
+import pyorient.ogm.property
 
 class GraphElement(object):
     def __init__(self, **kwargs):
@@ -16,17 +16,31 @@ class GraphElement(object):
 
         return elem
 
+    @property
+    def context(self):
+        """Get containing (graph) context"""
+        return self._graph
+
     def save(self):
-        """:returns: True if successful, False otherwise"""
+        """:return: True if successful, False otherwise"""
         if not self._graph:
             raise RuntimeError(
                 'Can not save() element: it has no corresponding Graph')
         return self._graph.save_element(self.__class__, self._props, self._id)
 
+    def query(self):
+        return self._graph.query(self)
+
+    def traverse(self, *what):
+        return self._graph.traverse(self, *what)
+
+    def update(self):
+        return self._graph.update(self)
+
     def __setattr__(self, key, value):
         # Check if the attribute is actually a property of the OGM type
         if (hasattr(type(self), key) and
-            isinstance(getattr(type(self), key), Property)):
+            isinstance(getattr(type(self), key), pyorient.ogm.property.Property)):
                 self._props[key] = value
                 return
 
@@ -38,7 +52,7 @@ class GraphElement(object):
         except:
             attr = super(GraphElement, self).__getattribute__(key)
             # Make sure to never return properties as instance attributes
-            if isinstance(attr, Property):
+            if isinstance(attr, pyorient.ogm.property.Property):
                 return None
             else:
                 return attr

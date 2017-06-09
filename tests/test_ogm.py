@@ -10,9 +10,12 @@ from pyorient.groovy import GroovyScripts
 
 from pyorient.ogm.declarative import declarative_node, declarative_relationship
 from pyorient.ogm.property import (
-    String, Date, DateTime, Decimal, Integer, EmbeddedMap, EmbeddedSet, Float,
-    Link, UUID)
-from pyorient.ogm.what import expand, in_, out, distinct, sysdate
+    String, Date, DateTime, Decimal, Double, Integer, Short, Long, EmbeddedMap,
+    EmbeddedSet, Link, UUID)
+from pyorient.ogm.what import expand, in_, out, distinct, sysdate, QV
+
+from pyorient.ogm.update import Update
+from pyorient.ogm.sequence import Sequence, NewSequence, sequence
 
 AnimalsNode = declarative_node()
 AnimalsRelationship = declarative_relationship()
@@ -175,8 +178,13 @@ def get_colored_eaten_foods(animal, color) {
         batch = g.batch()
         batch['zombie'] = batch.animals.create(name='zombie',specie='undead')
         batch['brains'] = batch.foods.create(name='brains', color='grey')
+
         # Retry up to twenty times
         batch[:] = batch.eats.create(batch[:'zombie'], batch[:'brains']).retry(20)
+
+        with batch.if_((batch[:'brains'].in_(Eats).size() == 1) | (batch[:'brains'].color == 'grey')):
+            batch['white_matter'] = batch.foods.create(name='delicacy brains', color='white')
+            batch[:] = batch.eats.create(batch[:'zombie'], batch[:'white_matter'])
 
         batch['unicorn'] = batch.animals.create(name='unicorn', specie='mythical')
         batch['unknown'] = batch.foods.create(name='unknown', color='rainbow')
@@ -233,7 +241,7 @@ class Wallet(MoneyNode):
     element_plural = 'wallets'
 
     amount_precise = Decimal(name='amount', nullable=False)
-    amount_imprecise = Float()
+    amount_imprecise = Double()
 
 class Carries(MoneyRelationship):
     # No label set on relationship; Broker will not be attached to graph.
@@ -250,6 +258,30 @@ class OGMMoneyTestCase(unittest.TestCase):
 
         g.create_all(MoneyNode.registry)
         g.create_all(MoneyRelationship.registry)
+
+    def testDoubleSerialization(self):
+        # Using str() on a float object in Python 2 sometimes
+        # returns scientific notation, which causes queries to be misapplied.
+        # Similarly, many alternative approaches of turning floats to strings
+        # in Python can cause loss of precision.
+        g = self.g
+
+        # Try very large values, very small values, and values with a lot of decimals.
+        target_values = [1e50, 1e-50, 1.23456789012]
+
+        for value in target_values:
+            amount_imprecise = value
+            amount_precise = decimal.Decimal(amount_imprecise)
+
+            original_wallet = g.wallets.create(amount_imprecise=amount_imprecise,
+                                               amount_precise=amount_precise)
+            wallet = g.query(Wallet).filter(
+                (Wallet.amount_imprecise > (value * (1 - 1e-6))) &
+                (Wallet.amount_imprecise < (value * (1 + 1e+6)))
+            ).one()
+
+            assert wallet.amount_imprecise == original_wallet.amount_imprecise
+            assert wallet.amount_precise == original_wallet.amount_precise
 
     def testMoney(self):
         assert len(MoneyNode.registry) == 2
@@ -337,7 +369,7 @@ class OGMMoneyTestCase(unittest.TestCase):
 
         # Original property name, amount_precise, lost-in-translation
         assert type(WalletType.amount) == Decimal
-        assert type(WalletType.amount_imprecise) == Float
+        assert type(WalletType.amount_imprecise) == Double
         g.include(schema_registry)
 
         debt = decimal.Decimal(-42.0)
@@ -404,6 +436,7 @@ class OGMDateTimeTestCase(unittest.TestCase):
 
         # orientdb does not store microseconds
         # so make sure the generated datetime has none
+        # Timezones / UTC offset must also be stored separately
         at = datetime.now().replace(microsecond=0)
 
         g.datetime.create(name='now', at=at)
@@ -837,13 +870,22 @@ class OGMTestClassField(unittest.TestCase):
             declarative_node(), declarative_relationship(), auto_plural=True)
         g.clear_registry()
         g.include(database_registry)
-        self.assertEquals(
-            {'test_field_1': 'test_string_one', 'test_field_2': '"test string two"'},
-            g.registry['classfieldvertex'].class_fields)
+        if g.server_version > (2,2,0): # Ugly! TODO Isolate version at which behaviour was changed
+            self.assertEquals(
+                {'test_field_1': 'test_string_one', 'test_field_2': 'test string two'},
+                g.registry['classfieldvertex'].class_fields)
+            self.assertEquals(
+                {'test_field_1': 'test string two'},
+                g.registry['classfieldedge'].class_fields)
+        else:
+            self.assertEquals(
+                {'test_field_1': 'test_string_one', 'test_field_2': '"test string two"'},
+                g.registry['classfieldvertex'].class_fields)
+            self.assertEquals(
+                {'test_field_1': '"test string two"'},
+                g.registry['classfieldedge'].class_fields)
         self.assertEquals({}, g.registry['classfieldvertex2'].class_fields)
-        self.assertEquals(
-            {'test_field_1': '"test string two"'},
-            g.registry['classfieldedge'].class_fields)
+
 
 
 class OGMTestAbstractField(unittest.TestCase):
@@ -854,8 +896,15 @@ class OGMTestAbstractField(unittest.TestCase):
     def setUp(self):
         g = self.g = Graph(Config.from_url('abstract_classes', 'root', 'root'
                                            , initial_drop=True))
-        g.client.command('CREATE CLASS AbstractClass EXTENDS V ABSTRACT')
-        g.client.command('CREATE CLASS ConcreteClass EXTENDS V')
+
+        Node = declarative_node()
+        class AbstractClass(Node.Abstract):
+            element_type = 'AbstractClass'
+
+        class ConcreteClass(Node):
+            element_type = 'ConcreteClass'
+
+        g.create_all(Node.registry)
 
     def testAbstractFlag(self):
         g = self.g
@@ -864,3 +913,154 @@ class OGMTestAbstractField(unittest.TestCase):
             declarative_node(), declarative_relationship(), auto_plural=True)
         self.assertTrue(database_registry['AbstractClass'].abstract)
         self.assertFalse(database_registry['ConcreteClass'].abstract)
+
+class OGMTestSequences(unittest.TestCase):
+    Node = declarative_node()
+    class Counter(Node):
+        element_plural = 'counters'
+
+        name = String(nullable=False)
+        value = Long(nullable=False, default=0)
+
+    class Items(Node):
+        element_plural = 'items'
+
+        id = Long(nullable=False, unique=True)
+        qty = Short(nullable=False)
+        price = Decimal(nullable=False)
+
+    def __init__(self, *args, **kwargs):
+        super(OGMTestSequences, self).__init__(*args, **kwargs)
+        self.g = None
+
+    def setUp(self):
+        g = self.g = Graph(Config.from_url('ogm_updates', 'root', 'root'
+                                           , initial_drop=True))
+
+        g.create_all(OGMTestSequences.Node.registry)
+        self.mycounter = g.counters.create(name='mycounter')
+        self.sequences = g.sequences
+
+
+    def testSequences(self):
+        g = self.g
+
+        # A solution to auto-incrementing ids, when sequences not available (pre-OrientDB 2.2)
+        Counter = OGMTestSequences.Counter
+
+        create_first = g.batch()
+        create_first['counter'] = g.counters.update().increment((Counter.value, 1)).return_(Update.Before, QV.current()).where(Counter.name=='mycounter')
+        create_first[:] = create_first.items.create(id=create_first[:'counter'].value[0], qty=10, price=1000)
+        create_first.commit()
+
+        create_second = g.batch()
+        create_second['counter'] = self.mycounter.update().increment((Counter.value, 1)).return_(Update.Before, QV.current())
+        create_second['item'] = create_second.items.create(id=create_second[:'counter'].value[0], qty=20, price=1800)
+        second_item = create_second['$item']
+
+        self.assertEquals(second_item.id, 1)
+
+        if g.server_version < (2, 2, 0):
+            return
+
+        # Default start value is 0, so first call to next() gives 1
+        # Want it to be 2
+        seq = self.sequences.create('mycounter', Sequence.Ordered, start=1)
+        create_third = g.batch()
+        create_third[:] = create_third.items.create(id=seq.next(), qty=30, price=2500)
+        create_third.commit()
+
+        create_fourth = g.batch()
+        create_fourth['item'] = create_fourth.items.create(id=seq.next(), qty=40, price=3330)
+        fourth_item = create_fourth['$item']
+        self.assertEquals(fourth_item.id, 3)
+
+        with self.assertRaises(PyOrientCommandException):
+            self.sequences.create('mycounter', Sequence.Cached, 666, 2, 6)
+        self.sequences.drop(seq)
+
+
+        class SequencedItem(OGMTestSequences.Node):
+            element_plural = 'sequenced'
+
+            item_ids = NewSequence(Sequence.Ordered, start=-1)
+            # NOTE Disabled until https://github.com/orientechnologies/orientdb/issues/7399 fixed
+            #id = Long(nullable=False, unique=True, default=sequence('item_ids').next())
+            id = Long(nullable=False, unique=True)
+        g.create_class(SequencedItem)
+
+        batch_create = g.batch()
+        # Would be nice to use default value, but see NOTE above
+        item_ids = sequence('item_ids')
+        batch_create[:] = batch_create.sequenced.create(id=item_ids.next())
+        batch_create[:] = batch_create.sequenced.create(id=item_ids.next())
+        batch_create[:] = batch_create.sequenced.create(id=item_ids.next())
+        batch_create[:] = batch_create.sequenced.create(id=item_ids.next())
+        batch_create[:] = batch_create.sequenced.create(id=item_ids.next())
+        batch_create['last'] = batch_create.sequenced.create(id=item_ids.next())
+        last_item = batch_create['$last']
+        self.assertEquals(last_item.id, 5)
+
+class OGMTestTraversals(unittest.TestCase):
+    Node = declarative_node()
+    Relationship = declarative_relationship()
+
+    class Turtle(object):
+        @staticmethod
+        def species():
+            return 'turtle'
+
+    class Leonardo(Node, Turtle):
+        element_plural = 'leos'
+
+    class Donatello(Node, Turtle):
+        element_plural = 'dons'
+
+    class OnTopOf(Relationship):
+        label = 'on_top_of'
+
+    class LIFO(Relationship):
+        label = 'lifo'
+
+    def __init__(self, *args, **kwargs):
+        super(OGMTestTraversals, self).__init__(*args, **kwargs)
+        self.g = None
+
+    def setUp(self):
+        g = self.g = Graph(Config.from_url('ogm_traversals', 'root', 'root'
+                                           , initial_drop=True))
+
+        g.create_all(OGMTestTraversals.Node.registry)
+        g.create_all(OGMTestTraversals.Relationship.registry)
+
+    def testTraversals(self):
+        g = self.g
+
+        b = g.batch()
+
+        b['leo'] = b.leos.create()
+        b['tgt'] = b[:'leo'] # Placeholder batch variable
+        b['don'] = b.dons.create()
+        b[:] = b[:'don'](OGMTestTraversals.OnTopOf)>b[:'leo']
+        b['leo'] = b.leos.create()
+        b[:] = b[:'leo'](OGMTestTraversals.OnTopOf)>b[:'don']
+        b['don'] = b.dons.create()
+        b[:] = b[:'don'](OGMTestTraversals.OnTopOf)>b[:'leo']
+        b['leo'] = b.leos.create()
+        b[:] = b[:'leo'](OGMTestTraversals.OnTopOf)>b[:'don']
+        b['don'] = b.dons.create()
+        b[:] = b[:'don'](OGMTestTraversals.OnTopOf)>b[:'leo']
+        b['leo'] = b.leos.create()
+        b[:] = b[:'leo'](OGMTestTraversals.OnTopOf)>b[:'don']
+        b['don'] = b.dons.create()
+        b[:] = b[:'don'](OGMTestTraversals.OnTopOf)>b[:'leo']
+        b['top'] = b[:'tgt'](OGMTestTraversals.LIFO)>b[:'don']
+        b['leo'] = b.leos.create()
+        b[:] = b[:'leo'](OGMTestTraversals.OnTopOf)>b[:'don']
+        b[:] = g.update_edge(b[:'top']).set((OGMTestTraversals.LIFO.in_, b[:'leo']))
+        b['traversal'] = g.traverse(b[:'tgt'], in_(OGMTestTraversals.OnTopOf)).query().filter(QV.depth() > 0)
+        traversals = b['$traversal']
+
+        print('{}s all the way down'.format(traversals[0].species()))
+        self.assertEquals(len(traversals), 8)
+

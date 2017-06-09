@@ -58,6 +58,11 @@ class VertexBroker(Broker):
     def create_command(self, **kwargs):
         return self.g.create_vertex_command(self.element_cls, **kwargs)
 
+    def update(self):
+        return self.g.update(self.element_cls)
+
+    update_command = update
+
 class EdgeBroker(Broker):
     def create(self, from_vertex, to_vertex, **kwargs):
         return self.g.create_edge(
@@ -66,6 +71,11 @@ class EdgeBroker(Broker):
     def create_command(self, from_vertex, to_vertex, **kwargs):
         return self.g.create_edge_command(
             self.element_cls, from_vertex, to_vertex, **kwargs)
+
+    def update(self):
+        return self.g.update_edge(self.element_cls)
+
+    update_command = update
 
 def get_broker(cls):
     for v in cls.__dict__.values():
